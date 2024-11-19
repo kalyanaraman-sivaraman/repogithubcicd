@@ -1,4 +1,4 @@
-name: React Application CI/CD
+name: AWS_React_Deployment
 
 on:
   push:
@@ -6,54 +6,64 @@ on:
       - main
 
 env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_REGION: ${{ secrets.AWS_REGION }}
-  S3_BUCKET: ${{ secrets.S3_BUCKET }}
 
 jobs:
 
   build:
+    name: Build
     runs-on: ubuntu-latest
-    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-      
-    - name: Setup Node.js
-      uses: actions/setup-node@v3
+    - uses: actions/checkout@v2
+    - name: Use Node.js
+      uses: actions/setup-node@v2
       with:
-        node-version: '16'
-        
-    - name: Install dependencies
-      run: npm ci
-      
-    - name: Build React app
-      run: npm run build
-      
-    - name: Upload artifact
-      uses: actions/upload-artifact@v3
+        node-version: '14'
+    - run: npm ci
+    - run: npm run build
+    - uses: actions/upload-artifact@v2
       with:
-        name: react-app
+        name: build
         path: build
-        
-  deploy:
+
+  deploy-s3:
+    name: Deploy to S3
     needs: build
     runs-on: ubuntu-latest
-    
     steps:
-    - name: Download artifact
-      uses: actions/download-artifact@v3
+    - uses: actions/checkout@v2
+    - uses: actions/download-artifact@v2
       with:
-        name: react-app
-        
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v1
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-        
+        name: build
     - name: Deploy to S3
-      run: aws s3 sync build s3://${{ env.S3_BUCKET }} --delete
-      
-    - name: Invalidate CloudFront
-      run: aws cloudfront create-invalidation --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} --paths "/*"
+      run: aws s3 sync ./build s3://${{ secrets.S3_BUCKET_NAME }} --delete
+
+  deploy-lb:
+    name: Deploy to Load Balancer
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - uses: aws-actions/configure-aws-credentials@v1
+    - name: Deploy to ALB
+      env:
+        ALB_ARN: ${{ secrets.ALB_ARN }}
+        TARGET_GROUP_ARN: ${{ secrets.TARGET_GROUP_ARN }}
+        SUBNET_IDS: ${{ secrets.SUBNET_IDS }}
+        SECURITY_GROUP_IDS: ${{ secrets.SECURITY_GROUP_IDS }}
+      run: |
+        aws elbv2 create-listener --load-balancer-arn $ALB_ARN --protocol HTTP --port 80 --default-actions Type=forward,TargetGroupArn=$TARGET_GROUP_ARN
+        aws ecs create-service --service-name app-service --cluster ${{ secrets.ECS_CLUSTER_ARN }} --task-definition task-def.json --load-balancers targetGroupArn=$TARGET_GROUP_ARN,containerName=app-container,containerPort=80 --desired-count 2 --launch-type EC2 --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],securityGroups=[$SECURITY_GROUP_IDS],assignPublicIp=ENABLED}"
+
+  setup-kms:
+    name: Configure KMS
+    runs-on: ubuntu-latest
+    steps:
+    - uses: aws-actions/configure-aws-credentials@v1
+    - name: Create KMS Key
+      run: |
+        aws kms create-key --key-usage ENCRYPT_DECRYPT --origin EXTERNAL --tags Department=devops,Project=app
+        aws kms create-alias --alias-name alias/app-key --target-key-id ${{ steps.create-key.outputs.key-arn }}
+        aws kms put-key-policy --key-id ${{ steps.create-key.outputs.key-arn }} --policy-name default --policy file://kms-key-policy.json
